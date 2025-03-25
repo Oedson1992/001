@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+contract StableGoldX is ERC20, ERC20Votes, AccessControl, ReentrancyGuard, Pausable {
+    // ====== ESTRUTURAS E CONSTANTES ======
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+    bytes32 public constant DELEGATOR_ROLE = keccak256("DELEGATOR_ROLE");
+    
+    uint256 public constant MIN_PROPOSAL_THRESHOLD = 1000 * 10**18; // 1,000 SGX
+    uint256 public constant VOTING_PERIOD = 3 days;
+    uint256 public constant EXECUTION_DELAY = 1 days;
+    uint256 public constant QUORUM = 20_000 * 10**18; // 20,000 SGX
+    
+    struct Proposal {
+        address proposer;
+        uint256 startBlock;
+        uint256 endBlock;
+        bytes callData;
+        uint256 forVotes;
+        uint256 againstVotes;
+        bool executed;
+        string description;
+    }
+    
+    // ====== ESTADO DO CONTRATO ======
+    Proposal[] public proposals;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    mapping(address => address) public voteDelegations;
+    mapping(address => uint256) public delegationNonces;
+    
+    uint256 public goldReserve;
+    uint256 public btcReserve;
+    uint256 public ethReserve;
+    uint256 public maxWithdrawal;
+    
+    // ====== EVENTOS ======
+    event ProposalCreated(uint256 indexed proposalId, address indexed proposer);
+    event VoteCast(address indexed voter, uint256 indexed proposalId, bool support, uint256 votes);
+    event ProposalExecuted(uint256 indexed proposalId);
+    event DelegationSet(address indexed delegator, address indexed delegatee);
+    event ReserveUpdated(string asset, uint256 newAmount);
+
+    // ====== MODIFICADORES ======
+    modifier onlyDuringVoting(uint256 proposalId) {
+        require(block.number >= proposals[proposalId].startBlock, "Voting not started");
+        require(block.number < proposals[proposalId].endBlock, "Voting ended");
+        _;
+    }
+
+    // ====== CONSTRUTOR ======
+    constructor(address[] memory initialHolders, uint256[] memory amounts) 
+        ERC20("Stable GoldX", "SGX") 
+        ERC20Permit("Stable GoldX") 
+    {
+        require(initialHolders.length == amounts.length, "Invalid distribution");
+        
+        // Distribuição inicial descentralizada
+        for (uint256 i = 0; i < initialHolders.length; i++) {
+            _mint(initialHolders[i], amounts[i]);
+        }
+        
+        // Configuração inicial de governança
+        _grantRole(DEFAULT_ADMIN_ROLE, address(this)); // Contrato auto-gerenciado
+        _grantRole(GOVERNANCE_ROLE, initialHolders[0]); // Temporário para bootstrap
+    }
+
+    // ====== FUNÇÕES DE GOVERNANÇA ======
+    function propose(
+        bytes calldata _callData, 
+        string calldata _description
+    ) external returns (uint256) {
+        require(balanceOf(msg.sender) >= MIN_PROPOSAL_THRESHOLD, "Insufficient balance");
+        
+        uint256 proposalId = proposals.length;
+        proposals.push(Proposal({
+            proposer: msg.sender,
+            startBlock: block.number,
+            endBlock: block.number + VOTING_PERIOD / 12, // ~3 dias em blocos
+            callData: _callData,
+            forVotes: 0,
+            againstVotes: 0,
+            executed: false,
+            description: _description
+        }));
+        
+        emit ProposalCreated(proposalId, msg.sender);
+        return proposalId;
+    }
+
+    function vote(uint256 proposalId, bool support) external onlyDuringVoting(proposalId) {
+        require(!hasVoted[proposalId][msg.sender], "Already voted");
+        
+        address voter = getVoter(msg.sender);
+        uint256 votes = getPastVotes(voter, proposals[proposalId].startBlock - 1);
+        require(votes > 0, "No voting power");
+        
+        if (support) {
+            proposals[proposalId].forVotes += votes;
+        } else {
+            proposals[proposalId].againstVotes += votes;
+        }
+        
+        hasVoted[proposalId][msg.sender] = true;
+        emit VoteCast(voter, proposalId, support, votes);
+    }
+
+    function executeProposal(uint256 proposalId) external nonReentrant {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.number >= proposal.endBlock + EXECUTION_DELAY / 12, "Delay not passed");
+        require(!proposal.executed, "Already executed");
+        require(proposal.forVotes + proposal.againstVotes >= QUORUM, "Quorum not met");
+        require(proposal.forVotes > proposal.againstVotes, "Proposal rejected");
+        
+        (bool success, ) = address(this).call(proposal.callData);
+        require(success, "Execution failed");
+        
+        proposal.executed = true;
+        emit ProposalExecuted(proposalId);
+    }
+
+    // ====== SISTEMA DE DELEGAÇÃO ======
+    function delegate(address delegatee) external {
+        voteDelegations[msg.sender] = delegatee;
+        delegationNonces[msg.sender]++;
+        emit DelegationSet(msg.sender, delegatee);
+    }
+
+    function getVoter(address account) public view returns (address) {
+        address delegatee = voteDelegations[account];
+        return delegatee == address(0) ? account : delegatee;
+    }
+
+    // ====== FUNÇÕES ADMINISTRATIVAS (REQUEREM GOVERNANÇA) ======
+    function updateMaxWithdrawal(uint256 newMax) external onlyRole(GOVERNANCE_ROLE) {
+        maxWithdrawal = newMax;
+    }
+
+    function updateReserves(
+        uint256 gold,
+        uint256 btc,
+        uint256 eth
+    ) external onlyRole(GOVERNANCE_ROLE) {
+        goldReserve = gold;
+        btcReserve = btc;
+        ethReserve = eth;
+        emit ReserveUpdated("GOLD", gold);
+        emit ReserveUpdated("BTC", btc);
+        emit ReserveUpdated("ETH", eth);
+    }
+
+    // ====== OVERRIDES NECESSÁRIOS ======
+    function _afterTokenTransfer(address from, address to, uint256 amount)
+        internal
+        override(ERC20, ERC20Votes)
+    {
+        super._afterTokenTransfer(from, to, amount);
+    }
+
+    function _mint(address to, uint256 amount)
+        internal
+        override(ERC20, ERC20Votes)
+    {
+        super._mint(to, amount);
+    }
+
+    function _burn(address account, uint256 amount)
+        internal
+        override(ERC20, ERC20Votes)
+    {
+        super._burn(account, amount);
+    }
+}
